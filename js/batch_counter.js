@@ -6,16 +6,12 @@ app.registerExtension({
     async setup() {
         console.log("[Batch Counter] Extension loaded");
 
-        // -----------------------------
-        // 1) Create overlay
-        // -----------------------------
         const overlay = document.createElement("div");
         overlay.id = "nova-batch-counter-overlay";
         overlay.textContent = "Batch: -- / --";
+
         Object.assign(overlay.style, {
             position: "fixed",
-            right: "20px",
-            bottom: "20px",
             zIndex: "999999",
             padding: "10px 14px",
             background: "rgba(0, 0, 0, 0.78)",
@@ -26,19 +22,33 @@ app.registerExtension({
             boxShadow: "0 4px 12px rgba(0,0,0,0.35)",
             pointerEvents: "none",
             userSelect: "none",
+            display: "none",
         });
+
         document.body.appendChild(overlay);
 
-        let lastIndex = null;
-        let completedRounds = 0;
+        let currentBatchSize = null;
+        let lastKnownIndex = null;
+        let lastMainSrc = null;
+        let wasViewerOpen = false;
+        let pendingDirection = null; // "next" | "prev" | null
 
-        // -----------------------------
-        // 2) Utility helpers
-        // -----------------------------
+        async function fetchBatchInfo() {
+            try {
+                const response = await fetch("/nova_batch_counter/current");
+                const data = await response.json();
+                currentBatchSize = data.batch_size;
+            } catch (error) {
+                console.error("[Batch Counter] Failed to fetch batch info:", error);
+            }
+        }
+
         function isVisible(el) {
             if (!el) return false;
+
             const style = window.getComputedStyle(el);
             const rect = el.getBoundingClientRect();
+
             return (
                 style.display !== "none" &&
                 style.visibility !== "hidden" &&
@@ -48,187 +58,292 @@ app.registerExtension({
         }
 
         function getVisibleImages() {
-            // Grab all visible images on screen
-            // Then keep only images large enough to be relevant
-            const allImgs = [...document.querySelectorAll("img")];
-
-            return allImgs.filter((img) => {
+            return [...document.querySelectorAll("img")].filter((img) => {
                 if (!isVisible(img)) return false;
                 const rect = img.getBoundingClientRect();
-
-                // Ignore tiny icons/UI images
-                return rect.width >= 48 && rect.height >= 48;
+                return rect.width >= 40 && rect.height >= 40;
             });
         }
 
-        function findLikelyThumbnailGroup(images) {
-            // We try to find a parent container that holds several image thumbnails
-            // The "best" candidate is the visible parent containing the most images
-            const parentMap = new Map();
+        function getMainPreviewImage() {
+            const images = getVisibleImages();
 
-            for (const img of images) {
-                let parent = img.parentElement;
-                let depth = 0;
-
-                while (parent && depth < 5) {
-                    if (isVisible(parent)) {
-                        const count = parent.querySelectorAll("img").length;
-                        if (count >= 2) {
-                            parentMap.set(parent, count);
-                        }
-                    }
-                    parent = parent.parentElement;
-                    depth++;
-                }
-            }
-
-            if (parentMap.size === 0) return null;
-
-            let bestParent = null;
-            let bestCount = 0;
-
-            for (const [parent, count] of parentMap.entries()) {
-                if (count > bestCount) {
-                    bestCount = count;
-                    bestParent = parent;
-                }
-            }
-
-            return bestParent;
-        }
-
-        function getGalleryImages() {
-            const visibleImages = getVisibleImages();
-            if (visibleImages.length === 0) return [];
-
-            const group = findLikelyThumbnailGroup(visibleImages);
-            if (!group) return [];
-
-            const imgs = [...group.querySelectorAll("img")].filter((img) => {
-                if (!isVisible(img)) return false;
-                const rect = img.getBoundingClientRect();
-                return rect.width >= 48 && rect.height >= 48;
-            });
-
-            // Remove duplicates by src + size
-            const unique = [];
-            const seen = new Set();
-
-            for (const img of imgs) {
-                const key = `${img.currentSrc || img.src}|${img.width}|${img.height}`;
-                if (!seen.has(key)) {
-                    seen.add(key);
-                    unique.push(img);
-                }
-            }
-
-            return unique;
-        }
-
-        function getCurrentSelectedImageIndex(galleryImages) {
-            if (!galleryImages.length) return null;
-
-            // 1) Look for selected / active thumbnail styles
-            const selectedPatterns = [
-                '[aria-selected="true"] img',
-                '.selected img',
-                '.active img',
-                '.current img',
-                'img.selected',
-                'img.active',
-                'img.current',
-            ];
-
-            for (const selector of selectedPatterns) {
-                const selected = document.querySelector(selector);
-                if (selected) {
-                    const index = galleryImages.findIndex(
-                        (img) =>
-                            img === selected ||
-                            (img.currentSrc || img.src) === (selected.currentSrc || selected.src)
-                    );
-                    if (index !== -1) return index + 1;
-                }
-            }
-
-            // 2) Fallback:
-            // choose the largest visible image on screen as the "main preview"
-            const visibleImages = getVisibleImages();
-            let mainPreview = null;
+            let biggest = null;
             let biggestArea = 0;
 
-            for (const img of visibleImages) {
+            for (const img of images) {
                 const rect = img.getBoundingClientRect();
                 const area = rect.width * rect.height;
+
                 if (area > biggestArea) {
                     biggestArea = area;
-                    mainPreview = img;
+                    biggest = img;
                 }
             }
 
-            if (mainPreview) {
-                const previewSrc = mainPreview.currentSrc || mainPreview.src;
-                const index = galleryImages.findIndex(
-                    (img) => (img.currentSrc || img.src) === previewSrc
-                );
-                if (index !== -1) return index + 1;
+            return biggest;
+        }
+
+        function extractImageNumber(url) {
+            if (!url) return null;
+
+            try {
+                const parsed = new URL(url, window.location.origin);
+                const filename = parsed.searchParams.get("filename");
+                if (!filename) return null;
+
+                const match = filename.match(/_(\d+)_\.[a-zA-Z0-9]+$/);
+                if (!match) return null;
+
+                return parseInt(match[1], 10);
+            } catch (error) {
+                return null;
+            }
+        }
+
+        function getOpenedBatchThumbnails(mainImg) {
+            if (!mainImg || !currentBatchSize) return [];
+
+            let current = mainImg.parentElement;
+            let depth = 0;
+            let bestGroup = [];
+            let bestDistance = Infinity;
+
+            while (current && depth < 8) {
+                if (isVisible(current)) {
+                    const imgs = [...current.querySelectorAll("img")].filter((img) => {
+                        if (!isVisible(img)) return false;
+                        if (img === mainImg) return false;
+
+                        const rect = img.getBoundingClientRect();
+                        const mainRect = mainImg.getBoundingClientRect();
+
+                        const imgArea = rect.width * rect.height;
+                        const mainArea = mainRect.width * mainRect.height;
+
+                        return imgArea > 0 && imgArea < mainArea * 0.5;
+                    });
+
+                    const groups = new Map();
+
+                    for (const img of imgs) {
+                        const rect = img.getBoundingClientRect();
+                        const key = `${Math.round(rect.width / 10) * 10}x${Math.round(rect.height / 10) * 10}`;
+
+                        if (!groups.has(key)) {
+                            groups.set(key, []);
+                        }
+                        groups.get(key).push(img);
+                    }
+
+                    for (const [, group] of groups.entries()) {
+                        const distance = Math.abs(group.length - currentBatchSize);
+
+                        if (group.length >= 2 && distance < bestDistance) {
+                            bestDistance = distance;
+                            bestGroup = group;
+                        }
+                    }
+                }
+
+                current = current.parentElement;
+                depth++;
             }
 
-            return null;
+            if (!bestGroup.length) return [];
+
+            return [...bestGroup].sort((a, b) => {
+                const na = extractImageNumber(a.currentSrc || a.src);
+                const nb = extractImageNumber(b.currentSrc || b.src);
+
+                if (na === null && nb === null) return 0;
+                if (na === null) return 1;
+                if (nb === null) return -1;
+
+                return na - nb;
+            });
+        }
+
+        function detectCurrentIndex() {
+            const mainImg = getMainPreviewImage();
+            if (!mainImg || !currentBatchSize) return null;
+
+            const thumbnails = getOpenedBatchThumbnails(mainImg);
+            if (!thumbnails.length) return null;
+
+            const mainNumber = extractImageNumber(mainImg.currentSrc || mainImg.src);
+            if (mainNumber === null) return null;
+
+            const index = thumbnails.findIndex((img) => {
+                const thumbNumber = extractImageNumber(img.currentSrc || img.src);
+                return thumbNumber === mainNumber;
+            });
+
+            if (index === -1) return null;
+
+            return index + 1;
+        }
+
+        function isBatchViewerOpen() {
+            if (!currentBatchSize) return false;
+
+            const mainImg = getMainPreviewImage();
+            if (!mainImg) return false;
+
+            const thumbnails = getOpenedBatchThumbnails(mainImg);
+            if (!thumbnails.length) return false;
+
+            const validThumbNumbers = thumbnails
+                .map((img) => extractImageNumber(img.currentSrc || img.src))
+                .filter((n) => n !== null);
+
+            const mainNumber = extractImageNumber(mainImg.currentSrc || mainImg.src);
+
+            return (
+                mainNumber !== null &&
+                validThumbNumbers.length >= 2 &&
+                Math.abs(validThumbNumbers.length - currentBatchSize) <= 2
+            );
+        }
+
+        function clampIndex(index) {
+            if (!currentBatchSize) return index;
+            return Math.max(1, Math.min(index, currentBatchSize));
+        }
+
+        function positionOverlayOnImage() {
+            const mainImg = getMainPreviewImage();
+            if (!mainImg) return;
+
+            const rect = mainImg.getBoundingClientRect();
+            const margin = 12;
+
+            // Top-right corner inside the displayed preview image
+            overlay.style.left = `${rect.right - overlay.offsetWidth - margin}px`;
+            overlay.style.top = `${rect.top + margin}px`;
         }
 
         function updateOverlay() {
-            const galleryImages = getGalleryImages();
-            const total = galleryImages.length;
-
-            if (!total || total < 2) {
-                overlay.textContent = "Batch: -- / --";
+            if (!currentBatchSize) {
+                overlay.style.display = "none";
                 return;
             }
 
-            const currentIndex = getCurrentSelectedImageIndex(galleryImages);
+            const viewerOpen = isBatchViewerOpen();
+            const mainImg = getMainPreviewImage();
+            const mainSrc = mainImg ? (mainImg.currentSrc || mainImg.src) : null;
 
-            if (!currentIndex) {
-                overlay.textContent = `Batch: -- / ${total}`;
+            if (!viewerOpen) {
+                wasViewerOpen = false;
+                lastKnownIndex = null;
+                lastMainSrc = null;
+                overlay.style.display = "none";
                 return;
             }
 
-            // detect completed loop
-            if (
-                lastIndex !== null &&
-                lastIndex === total &&
-                currentIndex === 1
-            ) {
-                completedRounds += 1;
+            overlay.style.display = "block";
+
+            // Freshly opened batch viewer
+            if (!wasViewerOpen) {
+                wasViewerOpen = true;
+                lastKnownIndex = 1;
+                lastMainSrc = mainSrc;
+                overlay.textContent = `Batch: 1 / ${currentBatchSize}`;
+                positionOverlayOnImage();
+                return;
             }
 
-            overlay.textContent = `Batch: ${currentIndex} / ${total} • Loops: ${completedRounds}`;
-            lastIndex = currentIndex;
+            const exactIndex = detectCurrentIndex();
+
+            if (exactIndex !== null) {
+                lastKnownIndex = exactIndex;
+                lastMainSrc = mainSrc;
+                overlay.textContent = `Batch: ${lastKnownIndex} / ${currentBatchSize}`;
+                positionOverlayOnImage();
+                return;
+            }
+
+            // Fallback: if image changed but exact match failed, move using last action
+            if (mainSrc && lastMainSrc && mainSrc !== lastMainSrc && lastKnownIndex !== null) {
+                if (pendingDirection === "next") {
+                    lastKnownIndex = clampIndex(lastKnownIndex + 1);
+                } else if (pendingDirection === "prev") {
+                    lastKnownIndex = clampIndex(lastKnownIndex - 1);
+                }
+
+                lastMainSrc = mainSrc;
+                overlay.textContent = `Batch: ${lastKnownIndex} / ${currentBatchSize}`;
+                positionOverlayOnImage();
+                return;
+            }
+
+            // Keep last valid index instead of hiding or resetting
+            if (lastKnownIndex !== null) {
+                overlay.textContent = `Batch: ${lastKnownIndex} / ${currentBatchSize}`;
+                positionOverlayOnImage();
+                return;
+            }
+
+            overlay.style.display = "none";
         }
 
-        // -----------------------------
-        // 3) Observe UI changes
-        // -----------------------------
-        const observer = new MutationObserver(() => {
+        await fetchBatchInfo();
+        updateOverlay();
+
+        window.addEventListener("click", () => {
+            const viewerWasOpen = isBatchViewerOpen();
+            pendingDirection = viewerWasOpen ? "next" : null;
+
+            setTimeout(() => {
+                updateOverlay();
+                pendingDirection = null;
+            }, 100);
+        }, true);
+
+        window.addEventListener("keydown", (event) => {
+            if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+                pendingDirection = "prev";
+            } else if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+                pendingDirection = "next";
+            } else {
+                pendingDirection = null;
+            }
+
+            setTimeout(() => {
+                updateOverlay();
+                pendingDirection = null;
+            }, 100);
+        });
+
+        window.addEventListener("wheel", (event) => {
+            const viewerWasOpen = isBatchViewerOpen();
+            if (!viewerWasOpen) {
+                pendingDirection = null;
+            } else {
+                pendingDirection = event.deltaY > 0 ? "next" : "prev";
+            }
+
+            setTimeout(() => {
+                updateOverlay();
+                pendingDirection = null;
+            }, 100);
+        }, { passive: true });
+
+        window.addEventListener("resize", () => {
+            if (overlay.style.display !== "none") {
+                positionOverlayOnImage();
+            }
+        });
+
+        window.addEventListener("scroll", () => {
+            if (overlay.style.display !== "none") {
+                positionOverlayOnImage();
+            }
+        }, true);
+
+        setInterval(async () => {
+            await fetchBatchInfo();
             updateOverlay();
-        });
-
-        observer.observe(document.body, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ["class", "style", "src", "aria-selected"],
-        });
-
-        // Also update when user clicks or uses keyboard
-        window.addEventListener("click", updateOverlay, true);
-        window.addEventListener("keydown", () => {
-            // small delay so UI updates first
-            setTimeout(updateOverlay, 30);
-        });
-
-        // Initial update
-        setTimeout(updateOverlay, 300);
-        setTimeout(updateOverlay, 1000);
+        }, 1000);
     },
 });
